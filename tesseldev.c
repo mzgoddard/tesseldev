@@ -17,11 +17,12 @@
 #include <linux/socket.h>
 #include <linux/net.h>
 #include <net/af_unix.h>
+#include <linux/syscalls.h>
 
 #define DEVICE_NAME "tesseldev"
 #define CLASS_NAME "tessel"
 
-#define RING_FIFO_SIZE 65536
+#define RING_FIFO_SIZE 4096
 #define BUFSIZE 255
 
 #define STATUS_TRUE 1
@@ -60,7 +61,12 @@ struct ring_device {
     struct ring_file input;
     struct ring_file output;
 
+    // size_t spi_put_len;
+    // size_t spi_get_len;
+
     struct socket *socket;
+    struct work_struct socket_state_prework;
+    struct work_struct socket_state_work;
     struct work_struct socket_read_prework;
     struct work_struct socket_write_prework;
     struct work_struct socket_read_work;
@@ -70,6 +76,7 @@ struct ring_device {
         struct kvec vec;
     } socket_read;
     struct work_struct socket_write_work;
+    struct work_struct socket_cleanup_work;
 
     unsigned int minor;
 };
@@ -80,22 +87,46 @@ static int ring_open(struct inode *, struct file *);
 // static int ring_poll(struct file *, struct poll_table_struct *);
 static int ring_release(struct inode *, struct file *);
 
+// static void __ring_spi_add(
+//     struct ring_device *, struct spi_message *, struct spi_transfer **,
+//     size_t, void *, void *);
+// static size_t tesselring_spi_put_prepare(
+//     struct ring_device *, struct spi_message *, struct spi_transfer *,
+//     size_t);
+// static void ring_spi_put_finish(struct ring_device *);
+// static size_t ring_spi_get_prepare(
+//     struct ring_device *, struct spi_message *message, struct spi_transfer *,
+//     size_t);
+// static void ring_spi_get_finish(struct ring_device *);
+
+static void ring_socket_noop(struct sock *sk);
+static void ring_state_change(struct sock *sk);
 static void ring_data_ready(struct sock *sk);
 static void ring_write_space(struct sock *sk);
+static void ring_socket_prestate(struct work_struct *work);
+static void ring_socket_state(struct work_struct *work);
 static void ring_socket_preread(struct work_struct *work);
 static void ring_socket_prewrite(struct work_struct *work);
 static void ring_socket_read(struct work_struct *work);
 static void ring_socket_write(struct work_struct *work);
+static void ring_socket_cleanup(struct work_struct *work);
+
+static uint8_t get_channel_bitmask_state(uint8_t *bitmask, uint8_t channel);
+static void set_channel_bitmask_state(uint8_t *bitmask, uint8_t channel, bool state);
+static uint8_t extract_enabled_state(uint8_t *rx_buf, uint8_t channel);
 
 struct sockaddr_un usbd_sock_addr;
 
 struct tessel_device {
     struct ring_device *rings[N_CHANNEL];
 
+    uint8_t channels_receivable_bitmask;
     uint8_t channels_writable_bitmask;
     uint8_t channels_opened_bitmask;
     uint8_t channels_enabled_bitmask;
     int retries;
+
+    struct socket *servers[N_CHANNEL];
 
     int pin_irq_id;
 
@@ -103,6 +134,7 @@ struct tessel_device {
 
     struct spi_message header_message;
     struct spi_transfer header_transfers[2];
+
     struct spi_message body_message;
     struct spi_transfer body_transfers[N_CHANNEL * 2];
 
@@ -121,6 +153,8 @@ static struct workqueue_struct *spi_workqueue;
 static void tesseldev_queue_work(void);
 static void tesseldev_prework(struct work_struct *);
 static void tesseldev_work(struct work_struct *);
+
+static void tesseldev_server_ready(struct sock *sk);
 
 static DEFINE_SPINLOCK(spi_work_lock);
 static bool spi_working = false;
@@ -156,6 +190,9 @@ static struct ring_device * __ring_device_alloc(unsigned int minor) {
     unsigned long flags;
     bool unopened;
     struct ring_device *device = kzalloc(sizeof(struct ring_device), GFP_KERNEL);
+    if (device == NULL) {
+        goto err_alloc;
+    }
 
     spin_lock_irqsave(&open_lock, flags);
     unopened = tessel_dev->rings[minor] == NULL;
@@ -165,7 +202,7 @@ static struct ring_device * __ring_device_alloc(unsigned int minor) {
     spin_unlock_irqrestore(&open_lock, flags);
 
     if (!unopened) {
-        goto err;
+        goto err_opened;
     }
 
     if (!__ring_init(&device->input)) {
@@ -182,8 +219,9 @@ static struct ring_device * __ring_device_alloc(unsigned int minor) {
 err_output:
     __ring_release(&device->input);
 err_input:
-err:
+err_opened:
     kfree(device);
+err_alloc:
     return NULL;
 }
 
@@ -192,16 +230,17 @@ static void __ring_device_free(struct ring_device *device) {
     unsigned int minor;
 
     minor = device->minor;
+
+    spin_lock_irqsave(&open_lock, flags);
+    tessel_dev->rings[minor] = NULL;
+    spin_unlock_irqrestore(&open_lock, flags);
+
     __ring_release(&device->input);
     __ring_release(&device->output);
     if (device->socket) {
         sock_release(device->socket);
     }
     kfree(device);
-
-    spin_lock_irqsave(&open_lock, flags);
-    tessel_dev->rings[minor] = NULL;
-    spin_unlock_irqrestore(&open_lock, flags);
 }
 
 static int ring_open(struct inode *inode, struct file *file) {
@@ -227,29 +266,41 @@ static int ring_release(struct inode *inode, struct file *file) {
 
 static void __ring_socket_init(struct ring_device *device, struct socket *socket) {
     device->socket = socket;
+    INIT_WORK(&device->socket_state_prework, ring_socket_prestate);
+    INIT_WORK(&device->socket_state_work, ring_socket_state);
     INIT_WORK(&device->socket_read_prework, ring_socket_preread);
     INIT_WORK(&device->socket_read_work, ring_socket_read);
     INIT_WORK(&device->socket_write_prework, ring_socket_prewrite);
     INIT_WORK(&device->socket_write_work, ring_socket_write);
+    INIT_WORK(&device->socket_cleanup_work, ring_socket_cleanup);
 
     memset(&device->socket_read, 0, sizeof(device->socket_read));
     device->socket_read.vec = (struct kvec) { &device->socket_read.body, BUFSIZE };
 
     socket->sk->sk_user_data = device;
+    socket->sk->sk_state_change = ring_state_change;
     socket->sk->sk_data_ready = ring_data_ready;
     socket->sk->sk_write_space = ring_write_space;
+}
+
+static void __ring_socket_cleanup(struct ring_device *device) {
+    device->socket->sk->sk_user_data = NULL;
+    device->socket->sk->sk_state_change = ring_socket_noop;
+    device->socket->sk->sk_data_ready = ring_socket_noop;
+    device->socket->sk->sk_write_space = ring_socket_noop;
+
+    cancel_work_sync(&device->socket_state_prework);
+    cancel_work_sync(&device->socket_state_work);
+    cancel_work_sync(&device->socket_read_prework);
+    cancel_work_sync(&device->socket_read_work);
+    cancel_work_sync(&device->socket_write_prework);
+    cancel_work_sync(&device->socket_write_work);
 }
 
 static struct socket * ring_connect(unsigned int minor, struct sockaddr_un *addr, size_t addr_len, int flags) {
     int status;
     struct socket *socket = NULL;
     struct ring_device *device;
-
-    device = __ring_device_alloc(minor);
-    if (device == NULL) {
-        status = -1;
-        goto err;
-    }
 
     status = sock_create_kern(PF_UNIX, SOCK_STREAM, 0, &socket);
     // Check for errors
@@ -266,22 +317,56 @@ static struct socket * ring_connect(unsigned int minor, struct sockaddr_un *addr
         fatal("Error connecting to USB Daemon socket %s: %d\n", addr->sun_path, status);
         goto err_connect;
     }
+    info("Connected socket on channel %d\n", minor);
+
+    device = __ring_device_alloc(minor);
+    if (device == NULL) {
+        goto err_alloc;
+    }
 
     __ring_socket_init(device, socket);
 
     return socket;
 
+err_alloc:
 err_connect:
     sock_release(socket);
 err_create:
-    __ring_device_free(device);
-err:
     return NULL;
 }
 
-// static struct socket * ring_accept(unsigned int minor, struct socket *sock) {
-//
-// }
+static struct socket * ring_accept(unsigned int minor, struct socket *sock) {
+    int status = 0;
+    struct socket *socket = NULL;
+    struct ring_device *device;
+
+    status = kernel_accept(sock, &socket, O_NONBLOCK);
+    // Nonblocking failure returns EAGAIN error. We can safely ignore this error
+    // and try to accept again in the future as soon as we want like on some
+    // event.
+    if (status == -EAGAIN) {
+        goto err;
+    }
+    if (status < 0) {
+        fatal("Error accepting socket on channel %d: %d\n", minor, status);
+        goto err;
+    }
+    info("Accepted socket on channel %d\n", minor);
+
+    device = __ring_device_alloc(minor);
+    if (device == NULL) {
+        goto err_alloc;
+    }
+
+    __ring_socket_init(device, socket);
+
+    return socket;
+
+err_alloc:
+    sock_release(socket);
+err:
+    return NULL;
+}
 
 static ssize_t ring_read(struct file *file, char __user *buf, size_t len, loff_t *pos) {
    if (access_ok(VERIFY_WRITE, buf, len)) {
@@ -319,8 +404,23 @@ static ssize_t ring_write(struct file *file, const char __user *buf, size_t len,
    }
 }
 
+static void ring_socket_noop(struct sock *sk) {}
+
+static void ring_state_change(struct sock *sk) {
+    struct ring_device *device = (struct ring_device *) sk->sk_user_data;
+    if (!device) {
+        return;
+    }
+    if (queue_work(spi_workqueue, &device->socket_state_work)) {
+        queue_work(spi_workqueue, &device->socket_state_prework);
+    }
+}
+
 static void ring_data_ready(struct sock *sk) {
     struct ring_device *device = (struct ring_device *) sk->sk_user_data;
+    if (!device) {
+        return;
+    }
     if (queue_work(spi_workqueue, &device->socket_write_work)) {
         queue_work(spi_workqueue, &device->socket_write_prework);
     }
@@ -328,9 +428,17 @@ static void ring_data_ready(struct sock *sk) {
 
 static void ring_write_space(struct sock *sk) {
     struct ring_device *device = (struct ring_device *) sk->sk_user_data;
+    if (!device) {
+        return;
+    }
     if (queue_work(spi_workqueue, &device->socket_read_work)) {
         queue_work(spi_workqueue, &device->socket_read_prework);
     }
+}
+
+static void ring_socket_prestate(struct work_struct *work) {
+    struct ring_device *device = container_of(work, struct ring_device, socket_state_prework);
+    queue_work(spi_workqueue, &device->socket_state_work);
 }
 
 static void ring_socket_preread(struct work_struct *work) {
@@ -343,6 +451,14 @@ static void ring_socket_prewrite(struct work_struct *work) {
     queue_work(spi_workqueue, &device->socket_write_work);
 }
 
+static void ring_socket_state(struct work_struct *work) {
+    struct ring_device *device = container_of(work, struct ring_device, socket_state_work);
+
+    info("channel %d socket state %d\n", device->minor, (int) device->socket->sk->sk_state);
+
+    queue_work(spi_workqueue, &device->socket_write_work);
+}
+
 static void ring_socket_read(struct work_struct *work) {
     int status = 1;
     int len;
@@ -351,18 +467,22 @@ static void ring_socket_read(struct work_struct *work) {
 
     while (status > 0) {
         len = kfifo_len(&device->input.fifo);
-        if (device->socket_read.len == 0) {
+        if (len > 0 && device->socket_read.len == 0) {
             device->socket_read.vec.iov_base = device->socket_read.body;
             device->socket_read.vec.iov_len = BUFSIZE;
             device->socket_read.len = kfifo_out(&device->input.fifo, device->socket_read.body, BUFSIZE);
-            tesseldev_queue_work();
+            // if (!get_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan)) {
+            if (len > 0 && len <= BUFSIZE) {
+                // set_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan, true);
+                tesseldev_queue_work();
+            }
         }
         if (device->socket_read.len == 0) {
             break;
         }
         // else if (len > RING_FIFO_SIZE - BUFSIZE) {
         // }
-        status = kernel_sendmsg(device->socket, &msg, &device->socket_read.vec, 1, min(device->socket_read.len, (size_t) BUFSIZE));
+        status = kernel_sendmsg(device->socket, &msg, &device->socket_read.vec, 1, device->socket_read.len);
         debug("sent %d bytes from socket on channel %d.\n", status, device->minor);
         if (status > 0) {
             device->socket_read.vec.iov_base += status;
@@ -380,17 +500,41 @@ static void ring_socket_write(struct work_struct *work) {
     struct kvec vec = { body, BUFSIZE };
     struct ring_device *device = container_of(work, struct ring_device, socket_write_work);
 
-    while (status > 0 && kfifo_avail(&device->output.fifo) > BUFSIZE) {
+    while (status > 0 && kfifo_len(&device->output.fifo) == 0) {
         status = kernel_recvmsg(device->socket, &msg, &vec, 1, BUFSIZE, msg.msg_flags);
         debug("received %d bytes from socket on channel %d.\n", status, device->minor);
         if (status > 0) {
             len = kfifo_len(&device->output.fifo);
             kfifo_in(&device->output.fifo, body, status);
-            tesseldev_queue_work();
+            if (get_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, device->minor)) {
+                tesseldev_queue_work();
+            }
             // if (len == 0) {
             // }
         }
+        if (status == 0) {
+            info("channel %d closed remotely\n", device->minor);
+            queue_work(spi_workqueue, &device->socket_cleanup_work);
+        }
+        if (status == -ECONNRESET) {
+            error("channel %d forcefully closed remotely\n", device->minor);
+            queue_work(spi_workqueue, &device->socket_cleanup_work);
+        }
     }
+}
+
+static void ring_socket_cleanup(struct work_struct *work) {
+    uint8_t channel;
+    struct ring_device *device = container_of(work, struct ring_device, socket_cleanup_work);
+    channel = device->minor;
+    __ring_socket_cleanup(device);
+    __ring_device_free(device);
+
+    // Set the channel open status to false
+    set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, channel, false);
+
+    // Notify the MCU that this channel has closed.
+    tesseldev_queue_work();
 }
 
 static irqreturn_t tesseldev_irq(int cpl, void *dev_id) {
@@ -403,7 +547,8 @@ static bool ring_putable(struct ring_device *device) {
     if (device == NULL) {
         return false;
     }
-    return RING_FIFO_SIZE - kfifo_len(&device->input.fifo) > BUFSIZE;
+    return kfifo_len(&device->input.fifo) == 0;
+    // return kfifo_avail(&device->input.fifo) > BUFSIZE;
 }
 
 static ssize_t ring_len(struct ring_device *device) {
@@ -425,10 +570,64 @@ static ssize_t ring_put(struct ring_device *device, unsigned char *buf, size_t l
     return result;
 }
 
+// static void __ring_spi_add(struct ring_device *device, struct spi_message *message, struct spi_transfer **transfers, size_t len, void *tx_buf, void *rx_buf) {
+//     struct spi_transfer *transfer = *transfers;
+//     transfer->len = len;
+//     transfer->tx_buf = tx_buf;
+//     transfer->rx_buf = rx_buf;
+//     transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
+//     spi_message_add_tail(transfer, message);
+//     (*transfers)++;
+// }
+
+// static size_t tesselring_spi_put_prepare(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers, size_t len) {
+//     size_t desc = 0;
+//
+//     // struct __kfifo *fifo = &device->input.fifo.kfifo;
+//     // size_t size = fifo->mask + 1;
+//     // size_t off = fifo->in & fifo->mask;
+//     // size_t l = min(len, size - off);
+//     // device->spi_put_len = len;
+//     //
+//     // // __ring_spi_add(device, message, &transfers, l, NULL, fifo->data + off);
+//     // struct spi_transfer *transfer = transfers;
+//     // transfer->len = l;
+//     // transfer->rx_buf = fifo->data + off;
+//     // transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
+//     // spi_message_add_tail(transfer, message);
+//     // transfers++;
+//     // desc++;
+//     //
+//     // if (l != len) {
+//     //     // __ring_spi_add(device, message, &transfers, len - l, NULL, fifo->data);
+//     //     transfer = transfers;
+//     //     transfer->len = len - l;
+//     //     transfer->rx_buf = fifo->data;
+//     //     transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
+//     //     spi_message_add_tail(transfer, message);
+//     //     transfers++;
+//     //     desc++;
+//     // }
+//
+//     return desc;
+// }
+
+// static void ring_spi_put_finish(struct ring_device *device) {
+//     struct __kfifo *fifo = &device->input.fifo.kfifo;
+//     size_t old_len = fifo->in - fifo->out;
+//     fifo->in += device->spi_put_len;
+//     if (old_len == 0) {
+//         complete_all(&device->input.wait_data);
+//     }
+//     if (device->socket) {
+//         queue_work(spi_workqueue, &device->socket_read_work);
+//     }
+// }
+
 static ssize_t ring_get(struct ring_device *device, unsigned char *buf, size_t len) {
     size_t old_len = kfifo_len(&device->output.fifo);
     ssize_t result = kfifo_out(&device->output.fifo, buf, len);
-    if (old_len > RING_FIFO_SIZE - BUFSIZE) {
+    if (RING_FIFO_SIZE - old_len < BUFSIZE) {
         complete_all(&device->output.wait_data);
     }
     if (device->socket) {
@@ -436,6 +635,38 @@ static ssize_t ring_get(struct ring_device *device, unsigned char *buf, size_t l
     }
     return result;
 }
+
+// static size_t ring_spi_get_prepare(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers, size_t len) {
+//     size_t desc = 0;
+//
+//     struct __kfifo *fifo = &device->output.fifo.kfifo;
+//     size_t size = fifo->mask + 1;
+//     size_t off = fifo->out & fifo->mask;
+//     size_t l = min(len, size - off);
+//     device->spi_get_len = len;
+//
+//     __ring_spi_add(device, message, &transfers, l, fifo->data + off, NULL);
+//     desc++;
+//
+//     if (l != len) {
+//         __ring_spi_add(device, message, &transfers, len - l, fifo->data, NULL);
+//         desc++;
+//     }
+//
+//     return desc;
+// }
+//
+// static void ring_spi_get_finish(struct ring_device *device) {
+//     struct __kfifo *fifo = &device->output.fifo.kfifo;
+//     size_t old_len = fifo->in - fifo->out;
+//     fifo->out += device->spi_get_len;
+//     if (old_len > RING_FIFO_SIZE - BUFSIZE) {
+//         complete_all(&device->output.wait_data);
+//     }
+//     if (device->socket) {
+//         queue_work(spi_workqueue, &device->socket_write_work);
+//     }
+// }
 
 /*
 Fetches the stored open/closed state of a given channel
@@ -495,13 +726,14 @@ static void close_channel_connection(uint8_t channel) {
     info("Closing connection %d\n", channel);
     // We can only release socket rings.
     if (tessel_dev->rings[channel] && tessel_dev->rings[channel]->socket) {
+        __ring_socket_cleanup(tessel_dev->rings[channel]);
         __ring_device_free(tessel_dev->rings[channel]);
     }
 
     // Set the channel open status to false
     set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, channel, false);
     // // Set the writability to false
-    // set_channel_bitmask_state(&channels_writable_bitmask, channel, false);
+    // set_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, channel, false);
 }
 
 static bool enable_usb_daemon_socket(void) {
@@ -541,8 +773,8 @@ static void tesseldev_prework(struct work_struct *work) {
 }
 
 static void tesseldev_work(struct work_struct *work) {
-    unsigned long flags;
     int i;
+    unsigned long start;
 
     if (!spi_working) {
         return;
@@ -557,6 +789,7 @@ static void tesseldev_work(struct work_struct *work) {
         int chan;
 
         debug("pin_irq: %d\n", gpio_get_value(pin_irq));
+        gpio_get_value(pin_irq);
         // if (gpio_get_value(pin_irq) < 0) {
         //     break;
         // }
@@ -576,12 +809,21 @@ static void tesseldev_work(struct work_struct *work) {
 
         spi_message_init(&tessel_dev->header_message);
         memset(tessel_dev->header_transfers, 0, sizeof(tessel_dev->header_transfers));
+        memset(rx_buf, 0, sizeof(rx_buf));
 
         for (i = 0; i < N_CHANNEL; i++) {
             // set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i, tessel_dev->rings[i] != NULL);
-            set_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, i, ring_putable(tessel_dev->rings[i]) && get_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i));
+            set_channel_bitmask_state(
+                &tessel_dev->channels_writable_bitmask,
+                i,
+                ring_putable(tessel_dev->rings[i]) &&
+                    get_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i)
+                );
             tessel_dev->buffers[i].out_length = ring_len(tessel_dev->rings[i]);
             tx_buf[2 + i] = tessel_dev->buffers[i].out_length;
+            // if (i > 0) {
+            //     tx_buf[2 + i] = 0;
+            // }
             // tx_buf[2 + i] = 0;
         }
 
@@ -598,22 +840,30 @@ static void tesseldev_work(struct work_struct *work) {
         tessel_dev->header_transfers[1].rx_buf = rx_buf;
         // tessel_dev->header_transfers[1].delay_usecs = 2;
         spi_message_add_tail(&tessel_dev->header_transfers[1], &tessel_dev->header_message);
+        // start = jiffies;
+        debug("rx: %2x %2x %2x %2x %2x\n", rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
         status = spi_sync(tessel_dev->dev, &tessel_dev->header_message);
+        // debug("Header message time %d %d\n", (jiffies - start), HZ);
 
         if (status < 0) {
             fatal("Failed to sync spi header message to MCU");
             break;
         }
 
+        debug("rx: %2x %2x %2x %2x %2x\n", rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
         if (rx_buf[0] != 0xCA) {
             error("Invalid command reply: %2x %2x %2x %2x %2x\n", rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
             tessel_dev->retries++;
 
+            // Set high so next setting 0 triggers the MCU to load headers.
+            gpio_set_value(pin_sync, 1);
+            udelay(10);
+
             if (tessel_dev->retries > 15) {
                 fatal("Too many retries, exiting");
+                tessel_dev->retries = 0;
                 break;
             } else {
-                udelay(10);
                 continue;
             }
         }
@@ -628,18 +878,32 @@ static void tesseldev_work(struct work_struct *work) {
             // If the status hasn't changed
             if (new_status == old_status) {
                 debug("Status has not changed.\n");
+                if (old_status && !get_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i)) {
+                    if (i == USBD_CHANNEL) {
+                        enable_usb_daemon_socket();
+                    }
+                    else if (tessel_dev->servers[i]) {
+                        bool opened = ring_accept(i, tessel_dev->servers[i]) != NULL;
+                        // Mark the channel as opened
+                        set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i, opened);
+                    }
+                }
                 // Make no changes to the polling
                 continue;
             }
             // If the new status has the channel enabled
             else if (new_status == STATUS_TRUE) {
                 debug("Channel has been enabled!\n");
-                bool enabled = false;
                 if (i == USBD_CHANNEL) {
-                    enabled = enable_usb_daemon_socket();
+                    enable_usb_daemon_socket();
+                }
+                else if (tessel_dev->servers[i]) {
+                    bool opened = ring_accept(i, tessel_dev->servers[i]) != NULL;
+                    // Mark the channel as opened
+                    set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i, opened);
                 }
                 // Set the status as enabled
-                set_channel_bitmask_state(&tessel_dev->channels_enabled_bitmask, i, enabled);
+                set_channel_bitmask_state(&tessel_dev->channels_enabled_bitmask, i, true);
             }
             // If the new status disables the channel
             else {
@@ -652,12 +916,11 @@ static void tesseldev_work(struct work_struct *work) {
         }
 
         gpio_set_value(pin_sync, 1);
-
-        // Wait for MCU to set up its SPI hardware
         udelay(10);
 
         spi_message_init(&tessel_dev->body_message);
-        memset(&tessel_dev->body_transfers, 0, sizeof(tessel_dev->body_transfers));
+        memset(tessel_dev->body_transfers, 0, sizeof(tessel_dev->body_transfers));
+        debug("size of body_transfers %d %d\n", sizeof(struct spi_transfer), sizeof(tessel_dev->body_transfers));
 
         desc = 0;
 
@@ -677,10 +940,16 @@ static void tesseldev_work(struct work_struct *work) {
                 // Note that we will have no more data to send (once this is sent)
                 // channels[chan].out_length = 0;
 
-                tessel_dev->body_transfers[desc].speed_hz = 10000000;
+                tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
+
+                // tessel_dev->body_transfers[desc].speed_hz = 10000000;
                 // Mark that we need to make a SPI transaction
                 spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
                 desc++;
+                set_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, chan, false);
+            }
+            else if (rx_buf[1] & (1 << chan)) {
+                set_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, chan, true);
             }
 
             // The number of bytes the coprocessor wants to send to a channel
@@ -692,7 +961,8 @@ static void tesseldev_work(struct work_struct *work) {
                 tessel_dev->body_transfers[desc].len = size;
                 // Point our receive buffer to the in buf of the appropriate channel
                 tessel_dev->body_transfers[desc].rx_buf = &tessel_dev->buffers[chan].in_buf[0];
-                tessel_dev->body_transfers[desc].speed_hz = 10000000;
+                tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
+                // tessel_dev->body_transfers[desc].speed_hz = 10000000;
                 // Mark that we need a SPI transaction to take place
                 spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
                 desc++;
@@ -701,10 +971,17 @@ static void tesseldev_work(struct work_struct *work) {
 
         // If the previous logic designated the need for a SPI transaction
         if (desc != 0) {
+
+            // Wait for MCU to set up its SPI hardware
+            udelay(10 * desc);
+            // udelay(desc >= 1 ? 5 * (desc - 1) : 0);
+
             debug("Performing transfer on %i channels\n", desc);
 
             // Make the SPI transaction
+            // start = jiffies;
             status = spi_sync(tessel_dev->dev, &tessel_dev->body_message);
+            // debug("Body message %d time %d %d\n", desc, (jiffies - start), HZ);
 
             // Ensure there were no errors
             if (status < 0) {
@@ -741,13 +1018,20 @@ static void tesseldev_work(struct work_struct *work) {
 
         // Wait for MCU flag if it still wants to communicate
         udelay(10);
+
+        break;
     }
+}
+
+static void tesseldev_server_ready(struct sock *sk) {
+    tesseldev_queue_work();
 }
 
 static int tesseldev_probe(struct spi_device *spi) {
     int status = 0;
     int retval;
     int save;
+    int i;
 
     save = spi->max_speed_hz;
     spi->max_speed_hz = 20000000;
@@ -758,7 +1042,6 @@ static int tesseldev_probe(struct spi_device *spi) {
     info("%d Hz (max)\n", spi->max_speed_hz);
 
     // Register the device drivers (usb, port_a, port_b)
-    int i;
     for (i = 0; i < N_CHANNEL; i++) {
         tesseldev_devices[i] = device_create(tesseldev_class, NULL, MKDEV(majorNumber, i), NULL, DEVICE_NAME "%d", i);
         if (IS_ERR(tesseldev_devices[i])) {
@@ -857,35 +1140,93 @@ static int __init tesseldev_init(void) {
     }
     printk(KERN_INFO "TesselDev: device class registered correctly\n");
 
+    // mm_segment_t old_fs;
+    // old_fs = get_fs();
+    // set_fs(get_ds());
+    // char * socket_dir_dup = kmalloc(sizeof(SOCKET_DIR) + 1, GFP_KERNEL);
+    // snprintf(socket_dir_dup, sizeof(SOCKET_DIR) + 1, "%s/", SOCKET_DIR);
+    // info("creating %s directory\n", socket_dir_dup);
+    // int retval = sys_mkdir(socket_dir_dup, 0755);
+    // if (retval < 0) {
+    //     error("couldn't create %s directory: code %d\n", socket_dir_dup, retval);
+    // }
+    // struct file *_socket_dir = NULL;
+    // _socket_dir = filp_open(socket_dir_dup, O_RDONLY | O_CREAT | O_DIRECTORY, 0700);
+    // if (IS_ERR(_socket_dir)) {
+    //     error("couldn't open %s directory %d\n", socket_dir_dup, PTR_ERR(_socket_dir));
+    //     goto err_open;
+    // }
+    // filp_close(_socket_dir, NULL);
+// err_open:
+//     kfree(socket_dir_dup);
+//     set_fs(old_fs);
+
     // Create the listening unix domain sockets
     for (i = 0; i < N_CHANNEL; i++) {
 
         // If this is not the USB Daemon channel
         if (i != USBD_CHANNEL) {
-            // // Create a struct to store socket info
-            // struct sockaddr_un addr;
-            // // Use UNIX family sockets
-            // addr.sun_family = AF_UNIX;
-            // // Copy the path of the socket into the struct
-            // snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%d", argv[4], i);
-            // // Create the socket
+            struct socket *sock;
+            // Create a struct to store socket info
+            struct sockaddr_un addr;
+            // Use UNIX family sockets
+            addr.sun_family = AF_UNIX;
+            // Copy the path of the socket into the struct
+            snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/tessel%d", "/var/run", i);
+
+        //     mm_segment_t old_fs;
+        //     old_fs = get_fs();
+        //     set_fs(get_ds());
+        //
+        //     struct file * _socket_file = filp_open(addr.sun_path, O_CREAT, 0644);
+        //     if (IS_ERR(_socket_file)) {
+        //         error("couldn't create %s socket file: code %d\n", addr.sun_path, PTR_ERR(_socket_file));
+        //         goto err_open_file;
+        //     }
+        //     filp_close(_socket_file, NULL);
+        //     info("created %s socket file\n", addr.sun_path);
+        // err_open_file:
+        //     set_fs(old_fs);
+
+            // Create the socket
+            int retval = sock_create_kern(PF_UNIX, SOCK_STREAM, 0, &sock);
             // int fd = socket(addr.sun_family, SOCK_STREAM, 0);
-            // // Check for errors
-            // if (fd < 0) {
-            //     fatal("Error creating socket %s: %s\n", addr.sun_path, strerror(errno));
-            // }
+            // Check for errors
+            if (retval < 0) {
+                fatal("Error creating socket %s: %d\n", addr.sun_path, retval);
+                goto err_sock_create;
+            }
+
+            tessel_dev->servers[i] = sock;
+
             // // Delete any previous paths because we'll create a new one
             // unlink(addr.sun_path);
-            //
-            // // Bind to that socket address
-            // if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-            //     fatal("Error binding socket %s: %s\n", addr.sun_path, strerror(errno));
-            // }
-            //
-            // // Start listening for new connections
-            // if (listen(fd, 1) == -1) {
-            //     fatal("Error listening on socket %s: %s\n", addr.sun_path, strerror(errno));
-            // }
+
+            // Bind to that socket address
+            retval = kernel_bind(sock, (struct sockaddr *) &addr, sizeof(addr));
+            if (retval < 0) {
+                fatal("Error binding socket %s: %d\n", addr.sun_path, retval);
+                goto err_bind;
+            }
+
+            // Start listening for new connections
+            retval = kernel_listen(sock, 1);
+            if (retval < 0) {
+                fatal("Error listening on socket %s: %d\n", addr.sun_path, retval);
+                goto err_listen;
+            }
+
+            sock->sk->sk_state_change = tesseldev_server_ready;
+            sock->sk->sk_data_ready = tesseldev_server_ready;
+
+            continue;
+
+        err_listen:
+        err_bind:
+            sock_release(sock);
+            tessel_dev->servers[i] = NULL;
+        err_sock_create:
+            continue;
         }
         // If this is the USB Daemon channel
         else {
@@ -945,6 +1286,11 @@ err_gpio_sync:
 err_gpio_irq_input:
     gpio_free(pin_irq);
 err_gpio_irq:
+    for (i = 0; i < N_CHANNEL; i++) {
+        if (i != USBD_CHANNEL && tessel_dev->servers[i] != NULL) {
+            sock_release(tessel_dev->servers[i]);
+        }
+    }
     class_destroy(tesseldev_class);
 err_class:
     unregister_chrdev(majorNumber, DEVICE_NAME);
@@ -955,11 +1301,18 @@ err_alloc:
 }
 
 static void __exit tesseldev_exit(void) {
+    int i;
+
     spi_unregister_driver(&tesseldev_spi_driver);
     free_irq(tessel_dev->pin_irq_id, NULL);
     tessel_dev->pin_irq_id = 0;
     gpio_free(pin_sync);
     gpio_free(pin_irq);
+    for (i = 0; i < N_CHANNEL; i++) {
+        if (i != USBD_CHANNEL && tessel_dev->servers[i] != NULL) {
+            sock_release(tessel_dev->servers[i]);
+        }
+    }
     class_destroy(tesseldev_class);
     unregister_chrdev(majorNumber, DEVICE_NAME);
     kfree(tessel_dev);
