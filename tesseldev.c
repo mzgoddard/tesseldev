@@ -50,6 +50,7 @@ int pin_sync = 1;
 
 struct ring_file {
     struct kfifo fifo;
+    // DECLARE_KFIFO(fifo, uint8_t, RING_FIFO_SIZE);
     spinlock_t lock;
 
     // If read, waiting for data from MCU. If write, waiting for space to write
@@ -61,8 +62,13 @@ struct ring_device {
     struct ring_file input;
     struct ring_file output;
 
-    // size_t spi_put_len;
-    // size_t spi_get_len;
+    size_t spi_put_len;
+    size_t spi_get_len;
+
+    unsigned int minor;
+
+    bool socket_writing;
+    bool socket_reading;
 
     struct socket *socket;
     struct work_struct socket_state_prework;
@@ -71,15 +77,15 @@ struct ring_device {
     struct work_struct socket_write_prework;
     struct work_struct socket_read_work;
     struct {
-        char body[BUFSIZE];
+        // char body[BUFSIZE];
         size_t len;
-        struct kvec vec;
+        struct kvec vec[2];
     } socket_read;
     struct work_struct socket_write_work;
     struct work_struct socket_cleanup_work;
-
-    unsigned int minor;
 };
+
+struct ring_device tesselring_device_pool[3];
 
 static ssize_t ring_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t ring_write(struct file *, const char __user *, size_t, loff_t *);
@@ -87,17 +93,17 @@ static int ring_open(struct inode *, struct file *);
 // static int ring_poll(struct file *, struct poll_table_struct *);
 static int ring_release(struct inode *, struct file *);
 
-// static void __ring_spi_add(
+// static void __tesselring_spi_add(
 //     struct ring_device *, struct spi_message *, struct spi_transfer **,
 //     size_t, void *, void *);
-// static size_t tesselring_spi_put_prepare(
-//     struct ring_device *, struct spi_message *, struct spi_transfer *,
-//     size_t);
-// static void ring_spi_put_finish(struct ring_device *);
-// static size_t ring_spi_get_prepare(
-//     struct ring_device *, struct spi_message *message, struct spi_transfer *,
-//     size_t);
-// static void ring_spi_get_finish(struct ring_device *);
+static size_t tesselring_spi_put_prepare(
+    struct ring_device *, struct spi_message *, struct spi_transfer *,
+    size_t);
+static void tesselring_spi_put_finish(struct ring_device *);
+static size_t tesselring_spi_get_prepare(
+    struct ring_device *, struct spi_message *message, struct spi_transfer *,
+    size_t);
+static void tesselring_spi_get_finish(struct ring_device *);
 
 static void ring_socket_noop(struct sock *sk);
 static void ring_state_change(struct sock *sk);
@@ -108,7 +114,9 @@ static void ring_socket_state(struct work_struct *work);
 static void ring_socket_preread(struct work_struct *work);
 static void ring_socket_prewrite(struct work_struct *work);
 static void ring_socket_read(struct work_struct *work);
+static bool _ring_socket_read(struct ring_device *device, bool in_thread);
 static void ring_socket_write(struct work_struct *work);
+static bool _ring_socket_write(struct ring_device *device, bool in_thread);
 static void ring_socket_cleanup(struct work_struct *work);
 
 static uint8_t get_channel_bitmask_state(uint8_t *bitmask, uint8_t channel);
@@ -126,6 +134,9 @@ struct tessel_device {
     uint8_t channels_enabled_bitmask;
     int retries;
 
+    uint8_t tx_buf[2 + N_CHANNEL];
+    uint8_t rx_buf[2 + N_CHANNEL];
+
     struct socket *servers[N_CHANNEL];
 
     int pin_irq_id;
@@ -140,11 +151,21 @@ struct tessel_device {
 
     struct {
         int in_length;
-        char in_buf[BUFSIZE];
+        // char in_buf[BUFSIZE];
         int out_length;
-        char out_buf[BUFSIZE];
+        // char out_buf[BUFSIZE];
     } buffers[N_CHANNEL];
 };
+
+struct tessel_memory {
+    struct tessel_device device;
+    struct ring_device rings[N_CHANNEL];
+    struct {
+        uint8_t ring_buf[RING_FIFO_SIZE];
+    } buffers[N_CHANNEL * 2];
+};
+
+static struct tessel_memory *tessel_mem;
 
 static struct tessel_device *tessel_dev;
 
@@ -153,6 +174,7 @@ static struct workqueue_struct *spi_workqueue;
 static void tesseldev_queue_work(void);
 static void tesseldev_prework(struct work_struct *);
 static void tesseldev_work(struct work_struct *);
+static void tesseldev_pollwork(struct work_struct *);
 
 static void tesseldev_server_ready(struct sock *sk);
 
@@ -160,6 +182,7 @@ static DEFINE_SPINLOCK(spi_work_lock);
 static bool spi_working = false;
 static DECLARE_WORK(spi_prework, tesseldev_prework);
 static DECLARE_WORK(spi_work, tesseldev_work);
+static DECLARE_DELAYED_WORK(spi_poll_work, tesseldev_pollwork);
 
 static DEFINE_SPINLOCK(open_lock);
 
@@ -170,12 +193,20 @@ static int majorNumber;
 static struct class* tesseldev_class = NULL;
 static struct device* tesseldev_devices[N_CHANNEL];
 
-static struct ring_file * __ring_init(struct ring_file *ring) {
+static struct ring_file * __ring_init(struct ring_file *ring, unsigned int offset) {
     spin_lock_init(&ring->lock);
 
-    if (kfifo_alloc(&ring->fifo, RING_FIFO_SIZE, GFP_KERNEL) != 0) {
-        return NULL;
-    }
+    // if (kfifo_alloc(&ring->fifo, RING_FIFO_SIZE, GFP_KERNEL) != 0) {
+    //     return NULL;
+    // }
+
+    // INIT_KFIFO(ring->fifo);
+    struct __kfifo * fifo = &ring->fifo.kfifo;
+    fifo->in = 0;
+    fifo->out = 0;
+    fifo->mask = RING_FIFO_SIZE - 1;
+    fifo->esize = 0;
+    fifo->data = tessel_mem->buffers[offset].ring_buf;
 
     init_completion(&ring->wait_data);
 
@@ -183,13 +214,16 @@ static struct ring_file * __ring_init(struct ring_file *ring) {
 }
 
 static void __ring_release(struct ring_file *ring) {
-    kfifo_free(&ring->fifo);
+    // kfifo_free(&ring->fifo);
 }
 
 static struct ring_device * __ring_device_alloc(unsigned int minor) {
     unsigned long flags;
     bool unopened;
-    struct ring_device *device = kzalloc(sizeof(struct ring_device), GFP_KERNEL);
+    struct ring_device *device;
+    // device = kzalloc(sizeof(struct ring_device), GFP_KERNEL);
+    device = &tessel_mem->rings[minor];
+    memset(device, 0, sizeof(struct ring_device));
     if (device == NULL) {
         goto err_alloc;
     }
@@ -205,10 +239,10 @@ static struct ring_device * __ring_device_alloc(unsigned int minor) {
         goto err_opened;
     }
 
-    if (!__ring_init(&device->input)) {
+    if (!__ring_init(&device->input, minor * 2)) {
         goto err_input;
     }
-    if (!__ring_init(&device->output)) {
+    if (!__ring_init(&device->output, minor * 2 + 1)) {
         goto err_output;
     }
 
@@ -220,7 +254,7 @@ err_output:
     __ring_release(&device->input);
 err_input:
 err_opened:
-    kfree(device);
+    // kfree(device);
 err_alloc:
     return NULL;
 }
@@ -240,7 +274,7 @@ static void __ring_device_free(struct ring_device *device) {
     if (device->socket) {
         sock_release(device->socket);
     }
-    kfree(device);
+    // kfree(device);
 }
 
 static int ring_open(struct inode *inode, struct file *file) {
@@ -275,7 +309,7 @@ static void __ring_socket_init(struct ring_device *device, struct socket *socket
     INIT_WORK(&device->socket_cleanup_work, ring_socket_cleanup);
 
     memset(&device->socket_read, 0, sizeof(device->socket_read));
-    device->socket_read.vec = (struct kvec) { &device->socket_read.body, BUFSIZE };
+    // device->socket_read.vec = (struct kvec) { &device->socket_read.body, BUFSIZE };
 
     socket->sk->sk_user_data = device;
     socket->sk->sk_state_change = ring_state_change;
@@ -421,9 +455,17 @@ static void ring_data_ready(struct sock *sk) {
     if (!device) {
         return;
     }
-    if (queue_work(spi_workqueue, &device->socket_write_work)) {
+    // ring_socket_write(&device->socket_write_work);
+    if (!device->socket_writing && _ring_socket_write(device, false)) {
+        tesseldev_queue_work();
+    }
+    else if (device->socket_writing) {
         queue_work(spi_workqueue, &device->socket_write_prework);
     }
+    // if (queue_work(spi_workqueue, &device->socket_write_work)) {
+    //     queue_work(spi_workqueue, &device->socket_write_prework);
+    // }
+    // tesseldev_queue_work();
 }
 
 static void ring_write_space(struct sock *sk) {
@@ -431,9 +473,16 @@ static void ring_write_space(struct sock *sk) {
     if (!device) {
         return;
     }
-    if (queue_work(spi_workqueue, &device->socket_read_work)) {
+    if (!device->socket_reading && _ring_socket_read(device, false)) {
+        tesseldev_queue_work();
+    }
+    else if (device->socket_reading) {
         queue_work(spi_workqueue, &device->socket_read_prework);
     }
+    // if (queue_work(spi_workqueue, &device->socket_read_work)) {
+    //     queue_work(spi_workqueue, &device->socket_read_prework);
+    // }
+    // tesseldev_queue_work();
 }
 
 static void ring_socket_prestate(struct work_struct *work) {
@@ -457,24 +506,49 @@ static void ring_socket_state(struct work_struct *work) {
     info("channel %d socket state %d\n", device->minor, (int) device->socket->sk->sk_state);
 
     queue_work(spi_workqueue, &device->socket_write_work);
+    tesseldev_queue_work();
 }
 
 static void ring_socket_read(struct work_struct *work) {
-    int status = 1;
-    int len;
-    struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
     struct ring_device *device = container_of(work, struct ring_device, socket_read_work);
+    if (_ring_socket_read(device, true)) {
+        queue_work(spi_workqueue, &spi_work);
+    }
+}
+
+static bool _ring_socket_read(struct ring_device *device, bool in_thread) {
+    int status = 1;
+    // int len;
+    struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
+    struct __kfifo *fifo = &device->input.fifo.kfifo;
+    bool should_queue = false;
+
+    device->socket_reading = true;
 
     while (status > 0) {
-        len = kfifo_len(&device->input.fifo);
+        size_t len = fifo->in - fifo->out;
+        // len = kfifo_len(&device->input.fifo);
         if (len > 0 && device->socket_read.len == 0) {
-            device->socket_read.vec.iov_base = device->socket_read.body;
-            device->socket_read.vec.iov_len = BUFSIZE;
-            device->socket_read.len = kfifo_out(&device->input.fifo, device->socket_read.body, BUFSIZE);
+            size_t size = fifo->mask + 1;
+            size_t off = (fifo->out + 1) & fifo->mask;
+            size_t packet_len = (size_t) ((uint8_t *) fifo->data)[fifo->out & fifo->mask];
+            size_t l = min(packet_len, size - off);
+
+            device->socket_read.vec[0].iov_base = fifo->data + off;
+            device->socket_read.vec[0].iov_len = l;
+            device->socket_read.vec[1].iov_base = fifo->data;
+            device->socket_read.vec[1].iov_len = packet_len - l;
+            device->socket_read.len = packet_len;
+            fifo->out += 1 + packet_len;
+            // device->socket_read.vec.iov_base = device->socket_read.body;
+            // device->socket_read.vec.iov_len = BUFSIZE;
+            // device->socket_read.len = kfifo_out(&device->input.fifo, device->socket_read.body, BUFSIZE);
             // if (!get_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan)) {
-            if (len > 0 && len <= BUFSIZE) {
+            // if (len > 0 && len <= BUFSIZE) {
+            if (in_thread || RING_FIFO_SIZE - len < 1 + BUFSIZE) {
                 // set_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan, true);
-                tesseldev_queue_work();
+                should_queue = true;
+                // tesseldev_queue_work();
             }
         }
         if (device->socket_read.len == 0) {
@@ -482,32 +556,68 @@ static void ring_socket_read(struct work_struct *work) {
         }
         // else if (len > RING_FIFO_SIZE - BUFSIZE) {
         // }
-        status = kernel_sendmsg(device->socket, &msg, &device->socket_read.vec, 1, device->socket_read.len);
+        status = kernel_sendmsg(device->socket, &msg, device->socket_read.vec, 2, device->socket_read.len);
         debug("sent %d bytes from socket on channel %d.\n", status, device->minor);
         if (status > 0) {
-            device->socket_read.vec.iov_base += status;
-            device->socket_read.vec.iov_len -= status;
+            size_t v0_len = device->socket_read.vec[0].iov_len;
+            if (status > device->socket_read.vec[0].iov_len) {
+                size_t v1_status = status - v0_len;
+                device->socket_read.vec[1].iov_base += v1_status;
+                device->socket_read.vec[1].iov_len -= v1_status;
+            }
+            size_t v0_status = min(status, v0_len);
+            device->socket_read.vec[0].iov_base += v0_status;
+            device->socket_read.vec[0].iov_len -= v0_status;
             device->socket_read.len -= status;
+
+            // device->socket_read.vec.iov_base += status;
+            // device->socket_read.vec.iov_len -= status;
+            // device->socket_read.len -= status;
         }
     }
+
+    device->socket_reading = false;
+
+    return should_queue;
 }
 
 static void ring_socket_write(struct work_struct *work) {
+    struct ring_device *device = container_of(work, struct ring_device, socket_write_work);
+    if (_ring_socket_write(device, true)) {
+        queue_work(spi_workqueue, &spi_work);
+    }
+}
+
+static bool _ring_socket_write(struct ring_device *device, bool in_thread) {
     int status = 1;
     int len;
     struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
-    char body[BUFSIZE];
-    struct kvec vec = { body, BUFSIZE };
-    struct ring_device *device = container_of(work, struct ring_device, socket_write_work);
+    struct __kfifo *fifo = &device->output.fifo.kfifo;
+    struct kvec vec[2];
+    size_t size = fifo->mask + 1;
+    bool should_queue = false;
 
-    while (status > 0 && kfifo_len(&device->output.fifo) == 0) {
-        status = kernel_recvmsg(device->socket, &msg, &vec, 1, BUFSIZE, msg.msg_flags);
+    device->socket_writing = true;
+
+    while (status > 0 && size - (fifo->in - fifo->out) > 1 + BUFSIZE) {
+        size_t off = (fifo->in + 1) & fifo->mask;
+        size_t l = min(BUFSIZE, size - off);
+        vec[0].iov_base = fifo->data + off;
+        vec[0].iov_len = l;
+        vec[1].iov_base = fifo->data;
+        vec[1].iov_len = BUFSIZE - l;
+
+        status = kernel_recvmsg(device->socket, &msg, vec, 2, BUFSIZE, msg.msg_flags);
         debug("received %d bytes from socket on channel %d.\n", status, device->minor);
         if (status > 0) {
-            len = kfifo_len(&device->output.fifo);
-            kfifo_in(&device->output.fifo, body, status);
-            if (get_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, device->minor)) {
-                tesseldev_queue_work();
+            // len = kfifo_len(&device->output.fifo);
+            // kfifo_in(&device->output.fifo, body, status);
+            ((uint8_t *) fifo->data)[fifo->in & fifo->mask] = status;
+            fifo->in += 1 + status;
+            if (in_thread || get_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, device->minor)) {
+
+                should_queue = true;
+                // tesseldev_queue_work();
             }
             // if (len == 0) {
             // }
@@ -515,12 +625,18 @@ static void ring_socket_write(struct work_struct *work) {
         if (status == 0) {
             info("channel %d closed remotely\n", device->minor);
             queue_work(spi_workqueue, &device->socket_cleanup_work);
+            should_queue = false;
         }
         if (status == -ECONNRESET) {
             error("channel %d forcefully closed remotely\n", device->minor);
             queue_work(spi_workqueue, &device->socket_cleanup_work);
+            should_queue = false;
         }
     }
+
+    device->socket_writing = true;
+
+    return should_queue;
 }
 
 static void ring_socket_cleanup(struct work_struct *work) {
@@ -534,7 +650,7 @@ static void ring_socket_cleanup(struct work_struct *work) {
     set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, channel, false);
 
     // Notify the MCU that this channel has closed.
-    tesseldev_queue_work();
+    queue_work(spi_workqueue, &spi_work);
 }
 
 static irqreturn_t tesseldev_irq(int cpl, void *dev_id) {
@@ -547,15 +663,17 @@ static bool ring_putable(struct ring_device *device) {
     if (device == NULL) {
         return false;
     }
-    return kfifo_len(&device->input.fifo) == 0;
-    // return kfifo_avail(&device->input.fifo) > BUFSIZE;
+    // return kfifo_len(&device->input.fifo) == 0;
+    return kfifo_avail(&device->input.fifo) > 1 + BUFSIZE;
 }
 
 static ssize_t ring_len(struct ring_device *device) {
     if (device == NULL) {
         return 0;
     }
-    return min(kfifo_len(&device->output.fifo), (size_t) BUFSIZE);
+    // return min(kfifo_len(&device->output.fifo), (size_t) BUFSIZE);
+    struct __kfifo *fifo = &device->output.fifo.kfifo;
+    return fifo->in != fifo->out ? ((uint8_t *) fifo->data)[fifo->out & fifo->mask] : 0;
 }
 
 static ssize_t ring_put(struct ring_device *device, unsigned char *buf, size_t len) {
@@ -570,59 +688,77 @@ static ssize_t ring_put(struct ring_device *device, unsigned char *buf, size_t l
     return result;
 }
 
-// static void __ring_spi_add(struct ring_device *device, struct spi_message *message, struct spi_transfer **transfers, size_t len, void *tx_buf, void *rx_buf) {
-//     struct spi_transfer *transfer = *transfers;
-//     transfer->len = len;
-//     transfer->tx_buf = tx_buf;
-//     transfer->rx_buf = rx_buf;
-//     transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
-//     spi_message_add_tail(transfer, message);
-//     (*transfers)++;
-// }
+static void __tesselring_spi_add(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfer, size_t len, void *tx_buf, void *rx_buf) {
+    // struct spi_transfer *transfer = transfers;
+    transfer->len = len;
+    transfer->tx_buf = tx_buf;
+    transfer->rx_buf = rx_buf;
+    transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
+    spi_message_add_tail(transfer, message);
+}
 
-// static size_t tesselring_spi_put_prepare(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers, size_t len) {
-//     size_t desc = 0;
-//
-//     // struct __kfifo *fifo = &device->input.fifo.kfifo;
-//     // size_t size = fifo->mask + 1;
-//     // size_t off = fifo->in & fifo->mask;
-//     // size_t l = min(len, size - off);
-//     // device->spi_put_len = len;
-//     //
-//     // // __ring_spi_add(device, message, &transfers, l, NULL, fifo->data + off);
-//     // struct spi_transfer *transfer = transfers;
-//     // transfer->len = l;
-//     // transfer->rx_buf = fifo->data + off;
-//     // transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
-//     // spi_message_add_tail(transfer, message);
-//     // transfers++;
-//     // desc++;
-//     //
-//     // if (l != len) {
-//     //     // __ring_spi_add(device, message, &transfers, len - l, NULL, fifo->data);
-//     //     transfer = transfers;
-//     //     transfer->len = len - l;
-//     //     transfer->rx_buf = fifo->data;
-//     //     transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0;
-//     //     spi_message_add_tail(transfer, message);
-//     //     transfers++;
-//     //     desc++;
-//     // }
-//
-//     return desc;
-// }
+// #define __tesselring_spi_add(device, message, _transfer, _len, _tx_buf, _rx_buf) \
+// (void) ({ \
+//     struct spi_transfer *transfer = _transfer; \
+//     transfer->len = _len; \
+//     transfer->tx_buf = _tx_buf; \
+//     transfer->rx_buf = _rx_buf; \
+//     transfer->speed_hz = device->minor == USBD_CHANNEL ? 10000000 : 0; \
+//     spi_message_add_tail(transfer, message); \
+// })
 
-// static void ring_spi_put_finish(struct ring_device *device) {
-//     struct __kfifo *fifo = &device->input.fifo.kfifo;
-//     size_t old_len = fifo->in - fifo->out;
-//     fifo->in += device->spi_put_len;
-//     if (old_len == 0) {
-//         complete_all(&device->input.wait_data);
-//     }
-//     if (device->socket) {
-//         queue_work(spi_workqueue, &device->socket_read_work);
-//     }
-// }
+static size_t tesselring_spi_put_prepare(
+    struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers,
+    size_t len) {
+    size_t desc = 0;
+
+    struct __kfifo *fifo = &device->input.fifo.kfifo;
+    size_t size = fifo->mask + 1;
+    size_t off = (fifo->in + 1) & fifo->mask;
+    size_t l = min(len, size - off);
+    device->spi_put_len = len;
+    ((uint8_t *) fifo->data)[fifo->in & fifo->mask] = len;
+
+    __tesselring_spi_add(device, message, transfers, l, NULL, fifo->data + off);
+    desc++;
+
+    if (l != len) {
+        __tesselring_spi_add(device, message, transfers + 1, len - l, NULL, fifo->data);
+        desc++;
+    }
+
+    return desc;
+
+    // struct __kfifo *fifo = &device->input.fifo.kfifo;
+    // size_t size = fifo->mask + 1;
+    // size_t off = (fifo->in + 1) & fifo->mask;
+    // // size_t l = min(len, size - off);
+    // size_t til_end = size - off;
+    // device->spi_put_len = len;
+    // ((uint8_t *) fifo->data)[fifo->in & fifo->mask] = len;
+    //
+    // if (til_end < len) {
+    //     __tesselring_spi_add(device, message, transfers, til_end, NULL, fifo->data + off);
+    //     __tesselring_spi_add(device, message, transfers + 1, len - til_end, NULL, fifo->data);
+    //     return 2;
+    // }
+    // else {
+    //     __tesselring_spi_add(device, message, transfers, len, NULL, fifo->data + off);
+    //     return 1;
+    // }
+}
+
+static void tesselring_spi_put_finish(struct ring_device *device) {
+    struct __kfifo *fifo = &device->input.fifo.kfifo;
+    size_t old_len = fifo->in - fifo->out;
+    fifo->in += 1 + device->spi_put_len;
+    if (old_len == 0) {
+        complete_all(&device->input.wait_data);
+    }
+    if (device->socket) {
+        queue_work(spi_workqueue, &device->socket_read_work);
+    }
+}
 
 static ssize_t ring_get(struct ring_device *device, unsigned char *buf, size_t len) {
     size_t old_len = kfifo_len(&device->output.fifo);
@@ -636,37 +772,53 @@ static ssize_t ring_get(struct ring_device *device, unsigned char *buf, size_t l
     return result;
 }
 
-// static size_t ring_spi_get_prepare(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers, size_t len) {
-//     size_t desc = 0;
-//
-//     struct __kfifo *fifo = &device->output.fifo.kfifo;
-//     size_t size = fifo->mask + 1;
-//     size_t off = fifo->out & fifo->mask;
-//     size_t l = min(len, size - off);
-//     device->spi_get_len = len;
-//
-//     __ring_spi_add(device, message, &transfers, l, fifo->data + off, NULL);
-//     desc++;
-//
-//     if (l != len) {
-//         __ring_spi_add(device, message, &transfers, len - l, fifo->data, NULL);
-//         desc++;
-//     }
-//
-//     return desc;
-// }
-//
-// static void ring_spi_get_finish(struct ring_device *device) {
-//     struct __kfifo *fifo = &device->output.fifo.kfifo;
-//     size_t old_len = fifo->in - fifo->out;
-//     fifo->out += device->spi_get_len;
-//     if (old_len > RING_FIFO_SIZE - BUFSIZE) {
-//         complete_all(&device->output.wait_data);
-//     }
-//     if (device->socket) {
-//         queue_work(spi_workqueue, &device->socket_write_work);
-//     }
-// }
+static size_t tesselring_spi_get_prepare(struct ring_device *device, struct spi_message *message, struct spi_transfer *transfers, size_t len) {
+    size_t desc = 0;
+
+    struct __kfifo *fifo = &device->output.fifo.kfifo;
+    size_t size = fifo->mask + 1;
+    size_t off = (fifo->out + 1) & fifo->mask;
+    size_t l = min(len, size - off);
+    device->spi_get_len = len;
+
+    __tesselring_spi_add(device, message, transfers, l, fifo->data + off, NULL);
+    desc++;
+
+    if (l != len) {
+        __tesselring_spi_add(device, message, transfers + 1, len - l, fifo->data, NULL);
+        desc++;
+    }
+
+    return desc;
+
+    // struct __kfifo *fifo = &device->output.fifo.kfifo;
+    // size_t size = fifo->mask + 1;
+    // size_t off = (fifo->out + 1) & fifo->mask;
+    // size_t til_end = size - off;
+    // device->spi_get_len = len;
+    //
+    // if (til_end < len) {
+    //     __tesselring_spi_add(device, message, transfers, til_end, fifo->data + off, NULL);
+    //     __tesselring_spi_add(device, message, transfers + 1, len - til_end, fifo->data, NULL);
+    //     return 2;
+    // }
+    // else {
+    //     __tesselring_spi_add(device, message, transfers, len, fifo->data + off, NULL);
+    //     return 1;
+    // }
+}
+
+static void tesselring_spi_get_finish(struct ring_device *device) {
+    struct __kfifo *fifo = &device->output.fifo.kfifo;
+    size_t old_len = fifo->in - fifo->out;
+    fifo->out += 1 + device->spi_get_len;
+    if (RING_FIFO_SIZE - old_len < 1 + BUFSIZE) {
+        complete_all(&device->output.wait_data);
+    }
+    if (device->socket) {
+        queue_work(spi_workqueue, &device->socket_write_work);
+    }
+}
 
 /*
 Fetches the stored open/closed state of a given channel
@@ -755,9 +907,8 @@ static void tesseldev_queue_work() {
         return;
     }
 
-    if (queue_work(spi_workqueue, &spi_work)) {
-        queue_work(spi_workqueue, &spi_prework);
-    }
+    queue_work(spi_workqueue, &spi_work);
+    queue_work(spi_workqueue, &spi_prework);
 }
 
 static void tesseldev_prework(struct work_struct *work) {
@@ -782,8 +933,10 @@ static void tesseldev_work(struct work_struct *work) {
 
     // do the spid sync work
     for (;;) {
-        uint8_t tx_buf[2 + N_CHANNEL];
-        uint8_t rx_buf[2 + N_CHANNEL];
+        // uint8_t tx_buf[2 + N_CHANNEL];
+        // uint8_t rx_buf[2 + N_CHANNEL];
+        uint8_t *tx_buf = tessel_dev->tx_buf;
+        uint8_t *rx_buf = tessel_dev->rx_buf;
         int status;
         int desc;
         int chan;
@@ -808,8 +961,8 @@ static void tesseldev_work(struct work_struct *work) {
         udelay(10);
 
         spi_message_init(&tessel_dev->header_message);
-        memset(tessel_dev->header_transfers, 0, sizeof(tessel_dev->header_transfers));
-        memset(rx_buf, 0, sizeof(rx_buf));
+        // memset(tessel_dev->header_transfers, 0, sizeof(tessel_dev->header_transfers));
+        // memset(rx_buf, 0, sizeof(rx_buf));
 
         for (i = 0; i < N_CHANNEL; i++) {
             // set_channel_bitmask_state(&tessel_dev->channels_opened_bitmask, i, tessel_dev->rings[i] != NULL);
@@ -832,11 +985,13 @@ static void tesseldev_work(struct work_struct *work) {
 
         debug("tx: %2x %2x %2x %2x %2x\n", tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3], tx_buf[4]);
 
-        tessel_dev->header_transfers[0].len = sizeof(tx_buf);
+        // tessel_dev->header_transfers[0].len = sizeof(tx_buf);
+        tessel_dev->header_transfers[0].len = 2 + N_CHANNEL;
         tessel_dev->header_transfers[0].tx_buf = tx_buf;
         // tessel_dev->header_transfers[0].delay_usecs = 2;
         spi_message_add_tail(&tessel_dev->header_transfers[0], &tessel_dev->header_message);
-        tessel_dev->header_transfers[1].len = sizeof(rx_buf);
+        // tessel_dev->header_transfers[1].len = sizeof(rx_buf);
+        tessel_dev->header_transfers[1].len = 2 + N_CHANNEL;
         tessel_dev->header_transfers[1].rx_buf = rx_buf;
         // tessel_dev->header_transfers[1].delay_usecs = 2;
         spi_message_add_tail(&tessel_dev->header_transfers[1], &tessel_dev->header_message);
@@ -844,6 +999,9 @@ static void tesseldev_work(struct work_struct *work) {
         debug("rx: %2x %2x %2x %2x %2x\n", rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3], rx_buf[4]);
         status = spi_sync(tessel_dev->dev, &tessel_dev->header_message);
         // debug("Header message time %d %d\n", (jiffies - start), HZ);
+
+        spi_transfer_del(&tessel_dev->header_transfers[0]);
+        spi_transfer_del(&tessel_dev->header_transfers[1]);
 
         if (status < 0) {
             fatal("Failed to sync spi header message to MCU");
@@ -919,7 +1077,7 @@ static void tesseldev_work(struct work_struct *work) {
         udelay(10);
 
         spi_message_init(&tessel_dev->body_message);
-        memset(tessel_dev->body_transfers, 0, sizeof(tessel_dev->body_transfers));
+        // memset(tessel_dev->body_transfers, 0, sizeof(tessel_dev->body_transfers));
         debug("size of body_transfers %d %d\n", sizeof(struct spi_transfer), sizeof(tessel_dev->body_transfers));
 
         desc = 0;
@@ -929,23 +1087,24 @@ static void tesseldev_work(struct work_struct *work) {
             // If the coprocessor is ready to receive, and we have data to send
             if (rx_buf[1] & (1 << chan) && size > 0) {
                 debug("coprocessor is ready to receive and we have %d bytes from channel %d", size, chan);
-                // // Make this channel readable by others
-                // CONN_POLL(chan).events |= POLLIN;
-                // Set the length to the size we need to send
-                tessel_dev->body_transfers[desc].len = size;
-                // Fill the out buffer from the character device.
-                ring_get(tessel_dev->rings[chan], tessel_dev->buffers[chan].out_buf, size);
-                // Point the output buffer to the correct place
-                tessel_dev->body_transfers[desc].tx_buf = &tessel_dev->buffers[chan].out_buf[0];
-                // Note that we will have no more data to send (once this is sent)
-                // channels[chan].out_length = 0;
-
-                tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
-
-                // tessel_dev->body_transfers[desc].speed_hz = 10000000;
-                // Mark that we need to make a SPI transaction
-                spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
-                desc++;
+                desc += tesselring_spi_get_prepare(tessel_dev->rings[chan], &tessel_dev->body_message, tessel_dev->body_transfers + desc, size);
+                // // // Make this channel readable by others
+                // // CONN_POLL(chan).events |= POLLIN;
+                // // Set the length to the size we need to send
+                // tessel_dev->body_transfers[desc].len = size;
+                // // Fill the out buffer from the character device.
+                // ring_get(tessel_dev->rings[chan], tessel_dev->buffers[chan].out_buf, size);
+                // // Point the output buffer to the correct place
+                // tessel_dev->body_transfers[desc].tx_buf = &tessel_dev->buffers[chan].out_buf[0];
+                // // Note that we will have no more data to send (once this is sent)
+                // // channels[chan].out_length = 0;
+                //
+                // tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
+                //
+                // // tessel_dev->body_transfers[desc].speed_hz = 10000000;
+                // // Mark that we need to make a SPI transaction
+                // spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
+                // desc++;
                 set_channel_bitmask_state(&tessel_dev->channels_receivable_bitmask, chan, false);
             }
             else if (rx_buf[1] & (1 << chan)) {
@@ -957,15 +1116,16 @@ static void tesseldev_work(struct work_struct *work) {
             // Check that the channel is writable and there is data that needs to be received
             if (get_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan) && size > 0) {
                 debug("Channel %d is ready to have %d bytes written to it from bridge", chan, size);
-                // Set the appropriate size
-                tessel_dev->body_transfers[desc].len = size;
-                // Point our receive buffer to the in buf of the appropriate channel
-                tessel_dev->body_transfers[desc].rx_buf = &tessel_dev->buffers[chan].in_buf[0];
-                tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
-                // tessel_dev->body_transfers[desc].speed_hz = 10000000;
-                // Mark that we need a SPI transaction to take place
-                spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
-                desc++;
+                desc += tesselring_spi_put_prepare(tessel_dev->rings[chan], &tessel_dev->body_message, tessel_dev->body_transfers + desc, size);
+                // // Set the appropriate size
+                // tessel_dev->body_transfers[desc].len = size;
+                // // Point our receive buffer to the in buf of the appropriate channel
+                // tessel_dev->body_transfers[desc].rx_buf = &tessel_dev->buffers[chan].in_buf[0];
+                // tessel_dev->body_transfers[desc].speed_hz = chan == USBD_CHANNEL ? 10000000 : 0;
+                // // tessel_dev->body_transfers[desc].speed_hz = 10000000;
+                // // Mark that we need a SPI transaction to take place
+                // spi_message_add_tail(&tessel_dev->body_transfers[desc], &tessel_dev->body_message);
+                // desc++;
             }
         }
 
@@ -983,6 +1143,10 @@ static void tesseldev_work(struct work_struct *work) {
             status = spi_sync(tessel_dev->dev, &tessel_dev->body_message);
             // debug("Body message %d time %d %d\n", desc, (jiffies - start), HZ);
 
+            for (desc--; desc >= 0; desc--) {
+                spi_transfer_del(&tessel_dev->body_transfers[desc]);
+            }
+
             // Ensure there were no errors
             if (status < 0) {
                 fatal("SPI_IOC_MESSAGE: data: %d", status);
@@ -991,19 +1155,24 @@ static void tesseldev_work(struct work_struct *work) {
 
             // Write received data to the appropriate socket
             for (chan = 0; chan < N_CHANNEL; chan++) {
+                int size = tx_buf[2 + chan];
+                if (rx_buf[1] & (1 << chan) && size > 0) {
+                    tesselring_spi_get_finish(tessel_dev->rings[chan]);
+                }
                 // Get the length of the received data for this channel
-                int size = rx_buf[2 + chan];
+                size = rx_buf[2 + chan];
                 // Make sure that channel is writable and we have data to send to it
                 if (get_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan) && size > 0) {
                     // Write this data to the pipe
-                    int r = ring_put(tessel_dev->rings[chan], &tessel_dev->buffers[chan].in_buf[0], size);
+                    // int r = ring_put(tessel_dev->rings[chan], &tessel_dev->buffers[chan].in_buf[0], size);
+                    tesselring_spi_put_finish(tessel_dev->rings[chan]);
                     // int r = 0;
                     debug("%i: Write %u %i\n", chan, size, r);
-                    // Ensure there were no errors
-                    if (r < 0) {
-                        error("Error in write %i: %d\n", chan, r);
-                        break;
-                    }
+                    // // Ensure there were no errors
+                    // if (r < 0) {
+                    //     error("Error in write %i: %d\n", chan, r);
+                    //     break;
+                    // }
 
                     // // Mark we want to know when this pipe is writable again
                     // CONN_POLL(chan).events |= POLLOUT;
@@ -1016,11 +1185,39 @@ static void tesseldev_work(struct work_struct *work) {
             break;
         }
 
+        bool has_sendable_data = false;
+        bool received_data = false;
+        for (chan = 0; chan < N_CHANNEL; chan++) {
+            if (ring_len(tessel_dev->rings[chan])) {
+                has_sendable_data = true;
+                break;
+            }
+            if (chan == USBD_CHANNEL && get_channel_bitmask_state(&tessel_dev->channels_writable_bitmask, chan) && rx_buf[2 + chan] > 0) {
+                received_data = true;
+                break;
+            }
+        }
+        if (!has_sendable_data && !received_data) {
+            break;
+        }
+
         // Wait for MCU flag if it still wants to communicate
         udelay(10);
-
-        break;
     }
+}
+
+static void tesseldev_pollwork(struct work_struct *work) {
+    queue_delayed_work(spi_workqueue, &spi_poll_work, 5 * HZ);
+
+    int i;
+    for (i = 0; i < N_CHANNEL; i++) {
+        struct ring_device *ring = tessel_dev->rings[i];
+        if (ring) {
+            queue_work(spi_workqueue, &ring->socket_read_work);
+            queue_work(spi_workqueue, &ring->socket_write_work);
+        }
+    }
+    tesseldev_queue_work();
 }
 
 static void tesseldev_server_ready(struct sock *sk) {
@@ -1034,7 +1231,7 @@ static int tesseldev_probe(struct spi_device *spi) {
     int i;
 
     save = spi->max_speed_hz;
-    spi->max_speed_hz = 20000000;
+    spi->max_speed_hz = 24000000;
     retval = spi_setup(spi);
     if (retval < 0)
         spi->max_speed_hz = save;
@@ -1062,6 +1259,7 @@ static int tesseldev_probe(struct spi_device *spi) {
 
     spi_working = true;
     tesseldev_queue_work();
+    queue_delayed_work(spi_workqueue, &spi_poll_work, 5 * HZ);
 
     return status;
 
@@ -1115,11 +1313,18 @@ static int __init tesseldev_init(void) {
     // create character class
     info("Initializing the TesselDev LKM\n");
 
-    tessel_dev = kzalloc(sizeof(struct tessel_device), GFP_KERNEL);
-    if (tessel_dev == NULL) {
+    tessel_mem = kzalloc(sizeof(struct tessel_memory), GFP_KERNEL);
+    if (tessel_mem == NULL) {
         status = -ENOMEM;
         goto err_alloc;
     }
+
+    tessel_dev = &tessel_mem->device;
+    // tessel_dev = kzalloc(sizeof(struct tessel_device), GFP_KERNEL);
+    // if (tessel_dev == NULL) {
+    //     status = -ENOMEM;
+    //     goto err_alloc;
+    // }
 
     // Try to dynamically allocate a major number for the device -- more
     // difficult but worth it
@@ -1295,7 +1500,7 @@ err_gpio_irq:
 err_class:
     unregister_chrdev(majorNumber, DEVICE_NAME);
 err_chrdev:
-    kfree(tessel_dev);
+    kfree(tessel_mem);
 err_alloc:
     return status;
 }
@@ -1315,7 +1520,7 @@ static void __exit tesseldev_exit(void) {
     }
     class_destroy(tesseldev_class);
     unregister_chrdev(majorNumber, DEVICE_NAME);
-    kfree(tessel_dev);
+    kfree(tessel_mem);
 
     spi_working = false;
 
